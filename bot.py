@@ -11,16 +11,16 @@ from aiogram.types import Message, InputMediaPhoto
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("")
-CHANNEL_ID = os.getenv("2188730333")  # @mychannel или -1001234567890
+TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("@kavaikiti")  # например -1002188730333 или @channel
 ADMINS = {int(x) for x in os.getenv("105011935", "1951524388", "5594255687").split(",") if x.strip()}
 SETTINGS_FILE = "settings.json"
-ALBUM_WAIT = 1.5  # сек. ожидания остальных картинок альбома
+ALBUM_WAIT = 1.5
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-albums: dict[str, list[str]] = {}
+albums = {}
 
 
 def load_caption() -> str:
@@ -37,7 +37,7 @@ def save_caption(text: str) -> None:
 
 
 def is_admin(m: Message) -> bool:
-    return not ADMINS or (m.from_user and m.from_user.id in ADMINS)
+    return not ADMINS or (m.from_user is not None and m.from_user.id in ADMINS)
 
 
 @dp.message(Command("start"))
@@ -45,10 +45,11 @@ async def start(m: Message):
     if not is_admin(m):
         return
     await m.answer(
-        "Пришли или перешли мне картинки — я опубликую их в канал без источника и подписи.\n\n"
-        "/caption текст — задать готовую подпись (поддерживается HTML)\n"
-        "/nocaption — публиковать без подписи\n"
-        "/status — текущая подпись"
+        "Пришли или перешли мне картинки, я опубликую их в канал без источника.\n\n"
+        "/caption текст - задать готовую подпись\n"
+        "/nocaption - без подписи\n"
+        "/status - текущие настройки\n"
+        "/test - проверка доступа к каналу"
     )
 
 
@@ -76,46 +77,76 @@ async def status(m: Message):
     if not is_admin(m):
         return
     cap = load_caption()
-    await m.answer(f"Канал: {CHANNEL_ID}\nПодпись: {cap or '— нет —'}")
+    await m.answer(f"Канал: {CHANNEL_ID}\nПодпись: {cap or '- нет -'}")
 
 
-async def send_album(group_id: str):
+@dp.message(Command("test"))
+async def test(m: Message):
+    if not is_admin(m):
+        return
+    try:
+        chat = await bot.get_chat(CHANNEL_ID)
+        me = await bot.get_chat_member(CHANNEL_ID, bot.id)
+        await m.answer(f"Канал: {chat.title}\nСтатус бота: {me.status}")
+    except Exception as e:
+        await m.answer(f"❌ {e}")
+
+
+async def send_album(group_id: str, reply_to: Message):
     await asyncio.sleep(ALBUM_WAIT)
     file_ids = albums.pop(group_id, [])
     caption = load_caption() or None
-    for i in range(0, len(file_ids), 10):  # лимит Telegram — 10 в альбоме
-        chunk = file_ids[i:i + 10]
-        media = [
-            InputMediaPhoto(media=fid, caption=caption if (i == 0 and j == 0) else None)
-            for j, fid in enumerate(chunk)
-        ]
-        await bot.send_media_group(CHANNEL_ID, media)
+    try:
+        for i in range(0, len(file_ids), 10):
+            chunk = file_ids[i:i + 10]
+            media = [
+                InputMediaPhoto(
+                    media=fid,
+                    caption=caption if (i == 0 and j == 0) else None,
+                )
+                for j, fid in enumerate(chunk)
+            ]
+            await bot.send_media_group(CHANNEL_ID, media)
+        await reply_to.answer(f"✅ Опубликовано картинок: {len(file_ids)}")
+    except Exception as e:
+        logging.exception("album send failed")
+        await reply_to.answer(f"❌ Ошибка: {e}")
 
 
 @dp.message(F.photo)
 async def on_photo(m: Message):
     if not is_admin(m):
         return
-    file_id = m.photo[-1].file_id  # самый большой размер
+    file_id = m.photo[-1].file_id
 
     if m.media_group_id:
         gid = m.media_group_id
         if gid not in albums:
             albums[gid] = []
-            asyncio.create_task(send_album(gid))
+            asyncio.create_task(send_album(gid, m))
         albums[gid].append(file_id)
         return
 
-    await bot.send_photo(CHANNEL_ID, file_id, caption=load_caption() or None)
-    await m.react([]) if False else None
+    try:
+        await bot.send_photo(CHANNEL_ID, file_id, caption=load_caption() or None)
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("send failed")
+        await m.answer(f"❌ Ошибка: {e}")
 
 
 @dp.message(F.document & F.document.mime_type.startswith("image/"))
 async def on_image_document(m: Message):
-    # картинки, присланные «как файл» (без сжатия)
     if not is_admin(m):
         return
-    await bot.send_document(CHANNEL_ID, m.document.file_id, caption=load_caption() or None)
+    try:
+        await bot.send_document(
+            CHANNEL_ID, m.document.file_id, caption=load_caption() or None
+        )
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("send failed")
+        await m.answer(f"❌ Ошибка: {e}")
 
 
 async def main():
