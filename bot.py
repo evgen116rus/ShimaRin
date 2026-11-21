@@ -11,7 +11,7 @@ from aiogram.types import Message, InputMediaPhoto
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("9156288158:AAFuHVZHRjCgobeO2ySZvyZsKO0vXVhgH6A")
+TOKEN = os.getenv("")
 CHANNEL_ID = os.getenv("2188730333")  # @mychannel или -1001234567890
 ADMINS = {int(x) for x in os.getenv("105011935", "1951524388", "5594255687").split(",") if x.strip()}
 SETTINGS_FILE = "settings.json"
