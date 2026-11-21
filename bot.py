@@ -1,28 +1,41 @@
 import asyncio
+import html
 import json
-import os
 import logging
+import re
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InputMediaPhoto
+from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("@kavaikiti")  # например -1002188730333 или @channel
-ADMINS = {int(x) for x in os.getenv("105011935", "1951524388", "5594255687").split(",") if x.strip()}
+TOKEN = ("")
+CHANNEL_ID = ("-1002188730333")  # например -1002188730333 или @channel
+ADMINS = (105011935, 1951524388, 5594255687)
 SETTINGS_FILE = "settings.json"
 ALBUM_WAIT = 1.5
+
+SETTINGS_FILE = "settings.json"
+ALBUM_WAIT = 1.5
+MAX_UPLOAD = 50 * 1024 * 1024  # лимит Telegram на загрузку файла ботом
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-albums = {}
+albums = {}  # media_group_id -> [(kind, file_id), ...]
 
 
+# ---------- подпись ----------
 def load_caption() -> str:
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
@@ -40,12 +53,14 @@ def is_admin(m: Message) -> bool:
     return not ADMINS or (m.from_user is not None and m.from_user.id in ADMINS)
 
 
+# ---------- команды ----------
 @dp.message(Command("start"))
 async def start(m: Message):
     if not is_admin(m):
         return
     await m.answer(
-        "Пришли или перешли мне картинки, я опубликую их в канал без источника.\n\n"
+        "Пришли или перешли мне картинки, видео, GIF или ссылку на пост "
+        "(t.me/канал/номер), я опубликую их в канал без источника.\n\n"
         "/caption текст - задать готовую подпись\n"
         "/nocaption - без подписи\n"
         "/status - текущие настройки\n"
@@ -92,43 +107,81 @@ async def test(m: Message):
         await m.answer(f"❌ {e}")
 
 
+# ---------- альбомы ----------
+def make_media(kind: str, media, caption):
+    if kind == "video":
+        return InputMediaVideo(media=media, caption=caption)
+    return InputMediaPhoto(media=media, caption=caption)
+
+
+def queue_album(m: Message, kind: str, file_id: str):
+    gid = m.media_group_id
+    if gid not in albums:
+        albums[gid] = []
+        asyncio.create_task(send_album(gid, m))
+    albums[gid].append((kind, file_id))
+
+
 async def send_album(group_id: str, reply_to: Message):
     await asyncio.sleep(ALBUM_WAIT)
-    file_ids = albums.pop(group_id, [])
+    items = albums.pop(group_id, [])
     caption = load_caption() or None
     try:
-        for i in range(0, len(file_ids), 10):
-            chunk = file_ids[i:i + 10]
+        for i in range(0, len(items), 10):  # максимум 10 в альбоме
+            chunk = items[i:i + 10]
             media = [
-                InputMediaPhoto(
-                    media=fid,
-                    caption=caption if (i == 0 and j == 0) else None,
-                )
-                for j, fid in enumerate(chunk)
+                make_media(kind, fid, caption if (i == 0 and j == 0) else None)
+                for j, (kind, fid) in enumerate(chunk)
             ]
             await bot.send_media_group(CHANNEL_ID, media)
-        await reply_to.answer(f"✅ Опубликовано картинок: {len(file_ids)}")
+        await reply_to.answer(f"✅ Опубликовано файлов: {len(items)}")
     except Exception as e:
         logging.exception("album send failed")
         await reply_to.answer(f"❌ Ошибка: {e}")
 
 
+# ---------- фото / видео / GIF / файлы-картинки ----------
 @dp.message(F.photo)
 async def on_photo(m: Message):
     if not is_admin(m):
         return
     file_id = m.photo[-1].file_id
-
     if m.media_group_id:
-        gid = m.media_group_id
-        if gid not in albums:
-            albums[gid] = []
-            asyncio.create_task(send_album(gid, m))
-        albums[gid].append(file_id)
+        queue_album(m, "photo", file_id)
         return
-
     try:
         await bot.send_photo(CHANNEL_ID, file_id, caption=load_caption() or None)
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("send failed")
+        await m.answer(f"❌ Ошибка: {e}")
+
+
+@dp.message(F.video)
+async def on_video(m: Message):
+    if not is_admin(m):
+        return
+    file_id = m.video.file_id
+    if m.media_group_id:
+        queue_album(m, "video", file_id)
+        return
+    try:
+        await bot.send_video(CHANNEL_ID, file_id, caption=load_caption() or None)
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("send failed")
+        await m.answer(f"❌ Ошибка: {e}")
+
+
+@dp.message(F.animation)
+async def on_animation(m: Message):
+    # GIF (Telegram хранит их как зацикленные mp4)
+    if not is_admin(m):
+        return
+    try:
+        await bot.send_animation(
+            CHANNEL_ID, m.animation.file_id, caption=load_caption() or None
+        )
         await m.answer("✅ Опубликовано")
     except Exception as e:
         logging.exception("send failed")
@@ -149,7 +202,133 @@ async def on_image_document(m: Message):
         await m.answer(f"❌ Ошибка: {e}")
 
 
+# ---------- ссылки t.me/канал/номер ----------
+LINK_RE = re.compile(
+    r"https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{4,}))/(\d+)"
+)
+MEDIA_RE = re.compile(
+    r"tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)"
+    r"|(<video[^>]*>)"
+)
+SRC_RE = re.compile(r'\ssrc="([^"]+)"')
+
+
+async def fetch_media(username: str, msg_id: str):
+    """Возвращает [(kind, bytes)], kind: photo / video / animation."""
+    url = f"https://t.me/{username}/{msg_id}?embed=1&mode=tme"
+    timeout = aiohttp.ClientTimeout(total=120)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    result = []
+    seen = set()
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as s:
+        async with s.get(url) as r:
+            if r.status != 200:
+                return []
+            page = await r.text()
+        for mt in MEDIA_RE.finditer(page):
+            photo, tag = mt.groups()
+            if photo:
+                kind, src = "photo", photo
+            else:
+                sm = SRC_RE.search(tag)
+                if not sm:
+                    continue
+                src = sm.group(1)
+                kind = "animation" if " loop" in tag else "video"
+            src = html.unescape(src)
+            if src in seen:
+                continue
+            seen.add(src)
+            async with s.get(src) as r:
+                if r.status != 200:
+                    continue
+                data = await r.read()
+            if len(data) > MAX_UPLOAD:
+                raise ValueError("файл больше 50 МБ")
+            result.append((kind, data))
+    return result
+
+
+async def send_single(kind: str, data: bytes, caption):
+    if kind == "photo":
+        await bot.send_photo(
+            CHANNEL_ID, BufferedInputFile(data, "image.jpg"), caption=caption
+        )
+    elif kind == "animation":
+        await bot.send_animation(
+            CHANNEL_ID, BufferedInputFile(data, "anim.mp4"), caption=caption
+        )
+    else:
+        await bot.send_video(
+            CHANNEL_ID,
+            BufferedInputFile(data, "video.mp4"),
+            caption=caption,
+            supports_streaming=True,
+        )
+
+
+async def repost_link(priv_id, username, msg_id, caption):
+    # 1) публичный канал: скачиваем файлы и отправляем заново
+    if username:
+        try:
+            items = await fetch_media(username, msg_id)
+        except Exception:
+            logging.exception("fetch_media failed, пробую copy_message")
+            items = []
+
+        if len(items) == 1:
+            await send_single(items[0][0], items[0][1], caption)
+            return
+
+        if len(items) > 1:
+            if all(k in ("photo", "video") for k, _ in items):
+                media = [
+                    make_media(
+                        k,
+                        BufferedInputFile(b, f"{i}.{'jpg' if k == 'photo' else 'mp4'}"),
+                        caption if i == 0 else None,
+                    )
+                    for i, (k, b) in enumerate(items[:10])
+                ]
+                await bot.send_media_group(CHANNEL_ID, media)
+            else:  # есть GIF: в альбом их класть нельзя, шлём по одному
+                for i, (k, b) in enumerate(items):
+                    await send_single(k, b, caption if i == 0 else None)
+            return
+
+    # 2) запасной вариант: copy_message (без пометки "переслано")
+    from_chat = f"@{username}" if username else int(f"-100{priv_id}")
+    await bot.copy_message(
+        CHANNEL_ID, from_chat, int(msg_id), caption=caption or ""
+    )
+
+
+@dp.message(F.text.func(lambda t: bool(LINK_RE.search(t))))
+async def on_link(m: Message):
+    if not is_admin(m):
+        return
+    caption = load_caption() or None
+    done = 0
+    for priv_id, username, msg_id in LINK_RE.findall(m.text):
+        try:
+            await repost_link(priv_id, username, msg_id, caption)
+            done += 1
+        except Exception as e:
+            logging.exception("link repost failed")
+            await m.answer(f"❌ {username or priv_id}/{msg_id}: {e}")
+    if done:
+        await m.answer(f"✅ Опубликовано постов: {done}")
+
+
+# ---------- запуск ----------
 async def main():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Справка"),
+        BotCommand(command="caption", description="Задать подпись"),
+        BotCommand(command="nocaption", description="Без подписи"),
+        BotCommand(command="status", description="Текущие настройки"),
+        BotCommand(command="test", description="Проверить доступ к каналу"),
+    ])
     await dp.start_polling(bot)
 
 
