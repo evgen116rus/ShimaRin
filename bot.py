@@ -22,9 +22,9 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO)
 
 # ===== НАСТРОЙКИ: подставь свои значения =====
-TOKEN = "9156288158:AAFuHVZHRjCgobeO2ySZvyZsKO0vXVhgH6A"
-CHANNEL_ID = -1002188730333
-ADMINS = {105011935, 1951524388, 5594255687, 6978093886, 418379762}
+TOKEN = ""
+CHANNEL_ID = 
+ADMINS = {}
 # =============================================
 
 SETTINGS_FILE = "settings.json"
