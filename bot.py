@@ -15,20 +15,22 @@ from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 
 logging.basicConfig(level=logging.INFO)
 
 # ===== НАСТРОЙКИ: подставь свои значения =====
-TOKEN = ""
-CHANNEL_ID = 
-ADMINS = {}
+TOKEN = "9156288158:AAFuHVZHRjCgobeO2ySZvyZsKO0vXVhgH6A"
+CHANNEL_ID = -1002188730333
+ADMINS = {105011935, 1951524388, 5594255687, 6978093886, 418379762}
 # =============================================
 
 SETTINGS_FILE = "settings.json"
 ALBUM_WAIT = 1.5
 MAX_UPLOAD = 50 * 1024 * 1024  # лимит Telegram на загрузку файла ботом
+CAPTION_LIMIT = 1024           # лимит подписи к медиа
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -62,11 +64,41 @@ async def start(m: Message):
     await m.answer(
         "Пришли или перешли мне картинки, видео, GIF, пост из расширенного "
         "редактора или ссылку на пост, я опубликую их в канал без источника.\n\n"
-        "/caption текст - задать готовую подпись\n"
+        "/caption текст - задать готовую подпись (ссылки сохраняются)\n"
         "/nocaption - без подписи\n"
         "/status - текущие настройки\n"
         "/test - проверка доступа к каналу"
     )
+
+
+# Markdown-ссылка [текст](https://адрес) -> HTML-ссылка
+MD_LINK_RE = re.compile(
+    r'\[([^\]]+)\]\((?:<a href="[^"]*">)?(https?://[^)\s<]+)(?:</a>)?\)'
+)
+# Сущности, которые Telegram находит сам; это не форматирование от пользователя
+AUTO_ENTITIES = {
+    "bot_command", "url", "mention", "hashtag",
+    "cashtag", "email", "phone_number",
+}
+HTML_TAG_RE = re.compile(
+    r"</?(a|b|i|u|s|em|strong|code|pre|tg-spoiler|blockquote)\b", re.I
+)
+
+
+def build_caption(m: Message, command: CommandObject) -> str:
+    has_formatting = any(
+        e.type not in AUTO_ENTITIES for e in (m.entities or [])
+    )
+    if has_formatting:
+        # форматирование из меню Telegram (ссылка, жирный, курсив...)
+        parts = m.html_text.split(None, 1)
+        caption = parts[1] if len(parts) > 1 else ""
+    else:
+        raw = command.args or ""
+        # если пользователь сам написал HTML-теги, оставляем как есть
+        caption = raw if HTML_TAG_RE.search(raw) else html.escape(raw, quote=False)
+    # [текст](ссылка) в стиле Markdown -> настоящая ссылка
+    return MD_LINK_RE.sub(r'<a href="\2">\1</a>', caption).strip()
 
 
 @dp.message(Command("caption"))
@@ -76,8 +108,23 @@ async def set_caption(m: Message, command: CommandObject):
     if not command.args:
         await m.answer("Использование: /caption текст подписи")
         return
-    save_caption(command.args)
-    await m.answer("Подпись сохранена ✅")
+    caption = build_caption(m, command)
+    if not caption:
+        await m.answer("Подпись получилась пустой.")
+        return
+    try:
+        await m.answer(
+            caption,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except Exception as e:
+        await m.answer(f"❌ Не удалось разобрать подпись: {e}")
+        return
+    save_caption(caption)
+    note = ""
+    if len(re.sub(r"<[^>]+>", "", caption)) > CAPTION_LIMIT:
+        note = f"\n⚠️ Подпись длиннее {CAPTION_LIMIT} символов, Telegram не примет её к медиа."
+    await m.answer("Подпись сохранена ✅ Так она будет выглядеть (выше)." + note)
 
 
 @dp.message(Command("nocaption"))
@@ -93,7 +140,10 @@ async def status(m: Message):
     if not is_admin(m):
         return
     cap = load_caption()
-    await m.answer(f"Канал: {CHANNEL_ID}\nПодпись: {cap or '- нет -'}")
+    await m.answer(
+        f"Канал: {CHANNEL_ID}\nПодпись:\n{cap or '- нет -'}",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 
 @dp.message(Command("test"))
