@@ -27,6 +27,14 @@ CHANNEL_ID =
 ADMINS = {}
 # =============================================
 
+# Подпись по умолчанию (работает, пока не задана другая через /caption)
+DEFAULT_CAPTION = (
+    '<a href="https://t.me/boost/kavaikiti">поддержи канал бустом</a> '
+    "https://t.me/boost/kavaikiti"
+)
+# Подпись добавляется к каждому N-му посту (1 = к каждому)
+DEFAULT_EVERY = 10
+
 SETTINGS_FILE = "settings.json"
 ALBUM_WAIT = 1.5
 MAX_UPLOAD = 50 * 1024 * 1024  # лимит Telegram на загрузку файла ботом
@@ -38,18 +46,40 @@ dp = Dispatcher()
 albums = {}  # media_group_id -> [(kind, file_id), ...]
 
 
-# ---------- подпись ----------
-def load_caption() -> str:
+# ---------- настройки и подпись ----------
+def load_settings() -> dict:
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return json.load(f).get("caption", "")
-    except FileNotFoundError:
-        return ""
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
-def save_caption(text: str) -> None:
+def save_settings(data: dict) -> None:
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"caption": text}, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False)
+
+
+def get_caption() -> str:
+    return load_settings().get("caption", DEFAULT_CAPTION)
+
+
+def get_every() -> int:
+    try:
+        return max(1, int(load_settings().get("every", DEFAULT_EVERY)))
+    except (TypeError, ValueError):
+        return DEFAULT_EVERY
+
+
+def next_caption():
+    """Вызывается один раз на каждый пост. Каждый N-й пост получает подпись."""
+    s = load_settings()
+    s["counter"] = int(s.get("counter", 0)) + 1
+    save_settings(s)
+    caption = s.get("caption", DEFAULT_CAPTION)
+    if caption and s["counter"] % get_every() == 0:
+        return caption
+    return None
 
 
 def is_admin(m: Message) -> bool:
@@ -64,8 +94,9 @@ async def start(m: Message):
     await m.answer(
         "Пришли или перешли мне картинки, видео, GIF, пост из расширенного "
         "редактора или ссылку на пост, я опубликую их в канал без источника.\n\n"
-        "/caption текст - задать готовую подпись (ссылки сохраняются)\n"
-        "/nocaption - без подписи\n"
+        "/caption текст - задать подпись (ссылки сохраняются)\n"
+        "/every N - добавлять подпись к каждому N-му посту (1 = к каждому)\n"
+        "/nocaption - отключить подпись\n"
         "/status - текущие настройки\n"
         "/test - проверка доступа к каналу"
     )
@@ -120,28 +151,61 @@ async def set_caption(m: Message, command: CommandObject):
     except Exception as e:
         await m.answer(f"❌ Не удалось разобрать подпись: {e}")
         return
-    save_caption(caption)
+    s = load_settings()
+    s["caption"] = caption
+    save_settings(s)
     note = ""
     if len(re.sub(r"<[^>]+>", "", caption)) > CAPTION_LIMIT:
         note = f"\n⚠️ Подпись длиннее {CAPTION_LIMIT} символов, Telegram не примет её к медиа."
-    await m.answer("Подпись сохранена ✅ Так она будет выглядеть (выше)." + note)
+    await m.answer(
+        f"Подпись сохранена ✅ Так она будет выглядеть (выше).\n"
+        f"Добавляется к каждому {get_every()}-му посту."
+        + note
+    )
+
+
+@dp.message(Command("every"))
+async def set_every(m: Message, command: CommandObject):
+    if not is_admin(m):
+        return
+    try:
+        n = int((command.args or "").strip())
+    except ValueError:
+        n = 0
+    if n < 1:
+        await m.answer("Использование: /every 10 (1 = подпись к каждому посту)")
+        return
+    s = load_settings()
+    s["every"] = n
+    s["counter"] = 0  # счёт начинается заново
+    save_settings(s)
+    await m.answer(f"Готово ✅ Подпись будет у каждого {n}-го поста. Счётчик сброшен.")
 
 
 @dp.message(Command("nocaption"))
 async def no_caption(m: Message):
     if not is_admin(m):
         return
-    save_caption("")
-    await m.answer("Теперь публикую без подписи ✅")
+    s = load_settings()
+    s["caption"] = ""
+    save_settings(s)
+    await m.answer("Подпись отключена ✅ Чтобы включить снова, задай её через /caption.")
 
 
 @dp.message(Command("status"))
 async def status(m: Message):
     if not is_admin(m):
         return
-    cap = load_caption()
+    s = load_settings()
+    every = get_every()
+    counter = int(s.get("counter", 0))
+    until = every - (counter % every)
     await m.answer(
-        f"Канал: {CHANNEL_ID}\nПодпись:\n{cap or '- нет -'}",
+        f"Канал: {CHANNEL_ID}\n"
+        f"Подпись добавляется к каждому {every}-му посту.\n"
+        f"Опубликовано постов (счётчик): {counter}\n"
+        f"Подпись будет у поста через: {until}\n\n"
+        f"Подпись:\n{get_caption() or '- нет -'}",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -176,7 +240,7 @@ def queue_album(m: Message, kind: str, file_id: str):
 async def send_album(group_id: str, reply_to: Message):
     await asyncio.sleep(ALBUM_WAIT)
     items = albums.pop(group_id, [])
-    caption = load_caption() or None
+    caption = next_caption()  # альбом считается одним постом
     try:
         for i in range(0, len(items), 10):  # максимум 10 в альбоме
             chunk = items[i:i + 10]
@@ -201,7 +265,7 @@ async def on_photo(m: Message):
         queue_album(m, "photo", file_id)
         return
     try:
-        await bot.send_photo(CHANNEL_ID, file_id, caption=load_caption() or None)
+        await bot.send_photo(CHANNEL_ID, file_id, caption=next_caption())
         await m.answer("✅ Опубликовано")
     except Exception as e:
         logging.exception("send failed")
@@ -217,7 +281,7 @@ async def on_video(m: Message):
         queue_album(m, "video", file_id)
         return
     try:
-        await bot.send_video(CHANNEL_ID, file_id, caption=load_caption() or None)
+        await bot.send_video(CHANNEL_ID, file_id, caption=next_caption())
         await m.answer("✅ Опубликовано")
     except Exception as e:
         logging.exception("send failed")
@@ -231,7 +295,7 @@ async def on_animation(m: Message):
         return
     try:
         await bot.send_animation(
-            CHANNEL_ID, m.animation.file_id, caption=load_caption() or None
+            CHANNEL_ID, m.animation.file_id, caption=next_caption()
         )
         await m.answer("✅ Опубликовано")
     except Exception as e:
@@ -245,7 +309,7 @@ async def on_image_document(m: Message):
         return
     try:
         await bot.send_document(
-            CHANNEL_ID, m.document.file_id, caption=load_caption() or None
+            CHANNEL_ID, m.document.file_id, caption=next_caption()
         )
         await m.answer("✅ Опубликовано")
     except Exception as e:
@@ -259,7 +323,7 @@ async def on_video_document(m: Message):
         return
     try:
         await bot.send_document(
-            CHANNEL_ID, m.document.file_id, caption=load_caption() or None
+            CHANNEL_ID, m.document.file_id, caption=next_caption()
         )
         await m.answer("✅ Опубликовано")
     except Exception as e:
@@ -353,7 +417,7 @@ async def on_rich(m: Message):
         )
         return
     try:
-        await publish_items(items, load_caption() or None)
+        await publish_items(items, next_caption())
         await m.answer(f"✅ Опубликовано файлов: {len(items)}")
     except Exception as e:
         logging.exception("rich repost failed")
@@ -468,11 +532,10 @@ async def repost_link(priv_id, username, msg_id, caption):
 async def on_link(m: Message):
     if not is_admin(m):
         return
-    caption = load_caption() or None
     done = 0
     for priv_id, username, msg_id in LINK_RE.findall(m.text):
         try:
-            await repost_link(priv_id, username, msg_id, caption)
+            await repost_link(priv_id, username, msg_id, next_caption())
             done += 1
         except Exception as e:
             logging.exception("link repost failed")
@@ -556,7 +619,7 @@ async def on_text_with_preview(m: Message):
         if not data:
             await m.answer(f"❌ Не нашёл картинку или видео по ссылке: {url}")
             return
-        await send_single(kind, data, load_caption() or None)
+        await send_single(kind, data, next_caption())
         await m.answer("✅ Опубликовано")
     except Exception as e:
         logging.exception("preview repost failed")
@@ -582,7 +645,8 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Справка"),
         BotCommand(command="caption", description="Задать подпись"),
-        BotCommand(command="nocaption", description="Без подписи"),
+        BotCommand(command="every", description="Подпись каждому N-му посту"),
+        BotCommand(command="nocaption", description="Отключить подпись"),
         BotCommand(command="status", description="Текущие настройки"),
         BotCommand(command="test", description="Проверить доступ к каналу"),
     ])
