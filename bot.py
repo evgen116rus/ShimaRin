@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+from urllib.parse import urljoin
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -19,11 +20,11 @@ from aiogram.types import (
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = ("")
-CHANNEL_ID = ("-1002188730333")  # например -1002188730333 или @channel
-ADMINS = (105011935, 1951524388, 5594255687)
-SETTINGS_FILE = "settings.json"
-ALBUM_WAIT = 1.5
+# ===== НАСТРОЙКИ: подставь свои значения =====
+TOKEN = "9156288158:AAFuHVZHRjCgobeO2ySZvyZsKO0vXVhgH6A"
+CHANNEL_ID = -1002188730333
+ADMINS = {105011935, 1951524388, 5594255687, 6978093886, 418379762}
+# =============================================
 
 SETTINGS_FILE = "settings.json"
 ALBUM_WAIT = 1.5
@@ -59,8 +60,8 @@ async def start(m: Message):
     if not is_admin(m):
         return
     await m.answer(
-        "Пришли или перешли мне картинки, видео, GIF или ссылку на пост "
-        "(t.me/канал/номер), я опубликую их в канал без источника.\n\n"
+        "Пришли или перешли мне картинки, видео, GIF, пост из расширенного "
+        "редактора или ссылку на пост, я опубликую их в канал без источника.\n\n"
         "/caption текст - задать готовую подпись\n"
         "/nocaption - без подписи\n"
         "/status - текущие настройки\n"
@@ -140,7 +141,7 @@ async def send_album(group_id: str, reply_to: Message):
         await reply_to.answer(f"❌ Ошибка: {e}")
 
 
-# ---------- фото / видео / GIF / файлы-картинки ----------
+# ---------- фото / видео / GIF / файлы ----------
 @dp.message(F.photo)
 async def on_photo(m: Message):
     if not is_admin(m):
@@ -202,6 +203,132 @@ async def on_image_document(m: Message):
         await m.answer(f"❌ Ошибка: {e}")
 
 
+@dp.message(F.document & F.document.mime_type.startswith("video/"))
+async def on_video_document(m: Message):
+    if not is_admin(m):
+        return
+    try:
+        await bot.send_document(
+            CHANNEL_ID, m.document.file_id, caption=load_caption() or None
+        )
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("send failed")
+        await m.answer(f"❌ Ошибка: {e}")
+
+
+# ---------- посты из расширенного редактора (Rich Message) ----------
+def get_rich(m: Message):
+    rm = getattr(m, "rich_message", None) or (m.model_extra or {}).get("rich_message")
+    if rm is None:
+        return None
+    if hasattr(rm, "model_dump"):
+        return rm.model_dump(mode="json", exclude_none=True)
+    return rm
+
+
+def collect_media(node, out: list):
+    """Рекурсивно собирает фото, видео и GIF из блоков (в т.ч. вложенных)."""
+    if isinstance(node, dict):
+        t = node.get("type")
+        if t == "photo" and isinstance(node.get("photo"), list) and node["photo"]:
+            out.append(("photo", node["photo"][-1]["file_id"]))
+            return
+        if t in ("video", "animation"):
+            obj = node.get(t)
+            if isinstance(obj, dict) and obj.get("file_id"):
+                out.append((t, obj["file_id"]))
+                return
+        for v in node.values():
+            collect_media(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            collect_media(v, out)
+
+
+def collect_types(node, found: set):
+    if isinstance(node, dict):
+        if isinstance(node.get("type"), str):
+            found.add(node["type"])
+        for v in node.values():
+            collect_types(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            collect_types(v, found)
+
+
+async def publish_items(items: list, caption):
+    media_items = [(k, f) for k, f in items if k in ("photo", "video")]
+    animations = [f for k, f in items if k == "animation"]
+    first = True
+
+    for i in range(0, len(media_items), 10):
+        chunk = media_items[i:i + 10]
+        if len(chunk) == 1:
+            kind, fid = chunk[0]
+            cap = caption if first else None
+            if kind == "photo":
+                await bot.send_photo(CHANNEL_ID, fid, caption=cap)
+            else:
+                await bot.send_video(CHANNEL_ID, fid, caption=cap)
+        else:
+            media = [
+                make_media(k, f, caption if (first and j == 0) else None)
+                for j, (k, f) in enumerate(chunk)
+            ]
+            await bot.send_media_group(CHANNEL_ID, media)
+        first = False
+
+    for fid in animations:
+        await bot.send_animation(
+            CHANNEL_ID, fid, caption=caption if first else None
+        )
+        first = False
+
+
+@dp.message(lambda m: get_rich(m) is not None)
+async def on_rich(m: Message):
+    if not is_admin(m):
+        return
+    rich = get_rich(m)
+    items = []
+    collect_media(rich, items)
+    if not items:
+        types = set()
+        collect_types(rich, types)
+        logging.info("rich message without media: %s", rich)
+        await m.answer(
+            "❌ В этом посте не нашёл картинок. Типы блоков: "
+            + (", ".join(sorted(types)) or "нет")
+        )
+        return
+    try:
+        await publish_items(items, load_caption() or None)
+        await m.answer(f"✅ Опубликовано файлов: {len(items)}")
+    except Exception as e:
+        logging.exception("rich repost failed")
+        await m.answer(f"❌ Ошибка: {e}")
+
+
+# ---------- отправка скачанных файлов ----------
+async def send_single(kind: str, data: bytes, caption):
+    if kind == "photo":
+        await bot.send_photo(
+            CHANNEL_ID, BufferedInputFile(data, "image.jpg"), caption=caption
+        )
+    elif kind == "animation":
+        await bot.send_animation(
+            CHANNEL_ID, BufferedInputFile(data, "anim.mp4"), caption=caption
+        )
+    else:
+        await bot.send_video(
+            CHANNEL_ID,
+            BufferedInputFile(data, "video.mp4"),
+            caption=caption,
+            supports_streaming=True,
+        )
+
+
 # ---------- ссылки t.me/канал/номер ----------
 LINK_RE = re.compile(
     r"https?://(?:www\.)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]{4,}))/(\d+)"
@@ -249,24 +376,6 @@ async def fetch_media(username: str, msg_id: str):
     return result
 
 
-async def send_single(kind: str, data: bytes, caption):
-    if kind == "photo":
-        await bot.send_photo(
-            CHANNEL_ID, BufferedInputFile(data, "image.jpg"), caption=caption
-        )
-    elif kind == "animation":
-        await bot.send_animation(
-            CHANNEL_ID, BufferedInputFile(data, "anim.mp4"), caption=caption
-        )
-    else:
-        await bot.send_video(
-            CHANNEL_ID,
-            BufferedInputFile(data, "video.mp4"),
-            caption=caption,
-            supports_streaming=True,
-        )
-
-
 async def repost_link(priv_id, username, msg_id, caption):
     # 1) публичный канал: скачиваем файлы и отправляем заново
     if username:
@@ -285,7 +394,9 @@ async def repost_link(priv_id, username, msg_id, caption):
                 media = [
                     make_media(
                         k,
-                        BufferedInputFile(b, f"{i}.{'jpg' if k == 'photo' else 'mp4'}"),
+                        BufferedInputFile(
+                            b, f"{i}.{'jpg' if k == 'photo' else 'mp4'}"
+                        ),
                         caption if i == 0 else None,
                     )
                     for i, (k, b) in enumerate(items[:10])
@@ -318,6 +429,102 @@ async def on_link(m: Message):
             await m.answer(f"❌ {username or priv_id}/{msg_id}: {e}")
     if done:
         await m.answer(f"✅ Опубликовано постов: {done}")
+
+
+# ---------- сообщения со ссылкой-превью ----------
+META_RE = re.compile(r"<meta\s[^>]*>", re.I)
+
+
+def get_preview_url(m: Message):
+    lpo = m.link_preview_options
+    if lpo and lpo.url:
+        return lpo.url
+    for ent in (m.entities or []):
+        if ent.type == "text_link" and ent.url:
+            return ent.url
+        if ent.type == "url":
+            return ent.extract_from(m.text)
+    return None
+
+
+async def download(session, link):
+    async with session.get(link) as r:
+        if r.status != 200:
+            return None, None
+        ctype = r.headers.get("Content-Type", "").lower()
+        data = await r.read()
+    if len(data) > MAX_UPLOAD:
+        raise ValueError("файл больше 50 МБ")
+    if ctype.startswith("image/gif"):
+        return "animation", data
+    if ctype.startswith("image/"):
+        return "photo", data
+    if ctype.startswith("video/"):
+        return "video", data
+    return None, None
+
+
+async def fetch_remote(url: str):
+    """Ссылка на файл или на страницу с og:image / og:video."""
+    timeout = aiohttp.ClientTimeout(total=60)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as s:
+        # 1) ссылка сразу на файл
+        async with s.get(url) as r:
+            if r.status != 200:
+                return None, None
+            ctype = r.headers.get("Content-Type", "").lower()
+            page = await r.text(errors="ignore") if "html" in ctype else None
+        if page is None:
+            return await download(s, url)
+
+        # 2) страница: ищем og-теги
+        img = vid = None
+        for tag in META_RE.findall(page):
+            prop = re.search(r'(?:property|name)="og:(image|video)"', tag, re.I)
+            cont = re.search(r'content="([^"]+)"', tag, re.I)
+            if not prop or not cont:
+                continue
+            link = urljoin(url, html.unescape(cont.group(1)))
+            if prop.group(1).lower() == "video" and not vid:
+                vid = link
+            elif prop.group(1).lower() == "image" and not img:
+                img = link
+        link = vid or img
+        if not link:
+            return None, None
+        return await download(s, link)
+
+
+@dp.message(F.text, lambda m: bool(get_preview_url(m)))
+async def on_text_with_preview(m: Message):
+    if not is_admin(m):
+        return
+    url = get_preview_url(m)
+    try:
+        kind, data = await fetch_remote(url)
+        if not data:
+            await m.answer(f"❌ Не нашёл картинку или видео по ссылке: {url}")
+            return
+        await send_single(kind, data, load_caption() or None)
+        await m.answer("✅ Опубликовано")
+    except Exception as e:
+        logging.exception("preview repost failed")
+        await m.answer(f"❌ Ошибка: {e}")
+
+
+# ---------- всё остальное (должно быть последним) ----------
+@dp.message()
+async def fallback(m: Message):
+    uid = m.from_user.id if m.from_user else None
+    if not is_admin(m):
+        await m.answer(f"⛔ Нет доступа. Твой ID: {uid}")
+        return
+    await m.answer(
+        f"Не знаю, как опубликовать это сообщение (тип: {m.content_type}). "
+        "Поддерживаются фото, видео, GIF, файлы, посты из расширенного "
+        "редактора и ссылки."
+    )
 
 
 # ---------- запуск ----------
